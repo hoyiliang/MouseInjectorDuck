@@ -123,17 +123,16 @@ static void PS1_MOH_Inject(void)
 	
 	//paimYF = ClampFloat(paimYF, -2842528.f, 2842528.f);
 	//paimYF = ClampFloat(paimYF, -3842528.f, 3842528.f);
-	//if (paimYF > -984040.f && paimYF < 984040.f) {
+	/*if (paimYF > -984040.f && paimYF < 984040.f) {
 	uint8_t stick_y = PS1_MEM_ReadByte(MOH_RIGHT_STICK_Y_OFFSET); // this needs a rewrite, it jumps from two states nothing in between, it sucks ass
 		if (ymouse < 0)
 			stick_y = 0x0;
 		else
 			stick_y = 0xFF;
+	PS1_MEM_WriteByte(MOH_RIGHT_STICK_Y_OFFSET2, stick_y); //i guess this input must be there to scroll, logic could be that if paimY is near the range input right stick input, or check the instructions... naahh
+	}*/
 
-	//PS1_MEM_WriteByte(MOH_RIGHT_STICK_Y_OFFSET2, stick_y); //i guess this input must be there to scroll, logic could be that if paimY is near the range input right stick input, or check the instructions... naahh
-	//}
-
-	//PS1_MEM_WriteInt(camBase+MOH_CAMY_PAIM_OFFSET, (int32_t)paimYF);
+	PS1_MEM_WriteInt(camBase+MOH_CAMY_PAIM_OFFSET, (int32_t)paimYF);
 	PS1_MEM_WriteInt(camBase + MOH_CAMX_PAIM_OFFSET, (int32_t)paimXF);
 	}
 	else {
