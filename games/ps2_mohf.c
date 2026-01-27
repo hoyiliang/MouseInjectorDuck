@@ -23,9 +23,6 @@
 #include "../mouse.h"
 #include "game.h"
 
-
-//variables
-#define TAU 6.2831853f
 #define PS2_MOHF_CAMERA_BASE_POINTER 0x23F4A8
 #define PS2_MOHF_CAMERA_BASE_OFFSET_X 0x2A4
 #define PS2_MOHF_CAMERA_BASE_OFFSET_Y 0x2A8
@@ -38,6 +35,8 @@
 static uint8_t PS2_MOHF_Status(void);
 static uint8_t PS2_MOHF_DetectCamera(void);
 static void PS2_MOHF_Inject(void);
+
+void printdebug(uint64_t val);
 
 static const GAMEDRIVER GAMEDRIVER_INTERFACE =
 {
@@ -62,7 +61,7 @@ static uint32_t fov32 = 0;
 static uint8_t PS2_MOHF_Status(void)
 {
 	//SLUS_203.68 - 53 4C 55 53 5F 32 30 33 2E 36 38
-	return (PS2_MEM_ReadWord(0x00093390) == 0x534C5553 && PS2_MEM_ReadWord(0x00093394) == 0x5F323033) && PS2_MEM_ReadWord(0x00093398) == 0x2E36383B;
+	return (PS2_MEM_ReadWord(0x00093390) == 0x534C5553 && PS2_MEM_ReadWord(0x00093394) == 0x5F323033 && PS2_MEM_ReadWord(0x00093398) == 0x2E36383B);
 }
 
 

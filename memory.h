@@ -91,6 +91,7 @@ extern uint8_t PS2_MEM_ReadUInt8(const uint32_t addr);
 extern void PS2_MEM_WriteWord(const uint32_t addr, uint32_t value);
 extern void PS2_MEM_WriteUInt(const uint32_t addr, uint32_t value);
 extern void PS2_MEM_WriteUInt16(const uint32_t addr, uint16_t value);
+extern void PS2_MEM_WriteUInt8(const uint32_t addr, uint8_t value);
 extern void PS2_MEM_WriteInt16(const uint32_t addr, int16_t value);
 extern void PS2_MEM_WriteFloat(const uint32_t addr, float value);
 
@@ -114,3 +115,5 @@ extern void PSP_MEM_WriteUInt16(const uint32_t addr, uint16_t value);
 extern void PSP_MEM_WriteFloat(const uint32_t addr, float value);
 
 extern char hookedEmulatorName[80];
+extern uint64_t PS2HasBase;
+extern int isPcsx2handle;

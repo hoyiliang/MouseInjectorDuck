@@ -40,7 +40,7 @@ $(OBJDIR)main.o: $(SRCDIR)main.c $(SRCDIR)main.h $(SRCDIR)memory.h $(SRCDIR)mous
 $(OBJDIR)export.o: $(SRCDIR)export.c $(SRCDIR)export.h
 	$(CC) -c $(SRCDIR)export.c -o $(OBJDIR)export.o $(CFLAGS) $(WFLAGS)
 	
-$(OBJDIR)memory.o: $(SRCDIR)memory.c $(SRCDIR)memory.h
+$(OBJDIR)memory.o: $(SRCDIR)memory.c $(SRCDIR)memory.h $(SRCDIR)main.h $(SRCDIR)export.h
 	$(CC) -c $(SRCDIR)memory.c -o $(OBJDIR)memory.o $(CFLAGS) $(WFLAGS)
 
 $(OBJDIR)mouse.o: $(SRCDIR)mouse.c $(SRCDIR)mouse.h $(MANYMOUSEDIR)manymouse.h

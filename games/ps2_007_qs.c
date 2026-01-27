@@ -59,7 +59,7 @@ static uint32_t tempcambase = 0;
 //==========================================================================
 static uint8_t PS2_007QS_Status(void)
 {
-	return (PS2_MEM_ReadWord(0x00093390) == 0x534C5553 && PS2_MEM_ReadWord(0x00093394) == 0x5F323138) && PS2_MEM_ReadWord(0x00093398) == 0x2E31333B;
+	return (PS2_MEM_ReadWord(0x00093390) == 0x534C5553 && PS2_MEM_ReadWord(0x00093394) == 0x5F323138 && PS2_MEM_ReadWord(0x00093398) == 0x2E31333B);
 }
 
 //==========================================================================

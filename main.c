@@ -39,6 +39,7 @@ uint8_t invertpitch = 0;
 int isHooked = 0;
 uint8_t uncapTickrate = 0;
 uint8_t optionToggle = 0;
+uint8_t altPCSX2hook = 0;
 
 float out = 0;
 float out2 = 0;
@@ -242,9 +243,14 @@ static void GUI_Interact(void)
 		updateinterface = 1;
 		updatequick = 1;
 	}
-	if(K_CTRL0 && !updateinterface) // hide/show settings (CTRL+0)
+	if(K_CTRL1 && !updateinterface) // hide/show settings (CTRL+0)
 	{
 		locksettings = !locksettings;
+		updateinterface = 1;
+	}
+	if(K_CTRL2 && !updateinterface) // hide/show settings (CTRL+0)
+	{
+		altPCSX2hook = !altPCSX2hook;
 		updateinterface = 1;
 	}
 	if(updateinterface)
@@ -263,7 +269,7 @@ static void GUI_Update(void)
 	// printf("\n Mouse Injector for %s %s - %s\n", GAME_Name(), BUILDINFO, hookedEmulatorName); // title
 	printf("\n Mouse Injector %s for %s - %s\n", BUILDINFO, hookedEmulatorName, GAME_Name()); // title
 	printf("%s\n\n   Main Menu - Press [#] to Use Menu\n\n\n", LINE);
-	printf(mousetoggle ? "   [4] - [ON] Mouse Injection\n\n" : "   [4] - [OFF] Mouse Injection\n\n");
+	printf(mousetoggle ? "   [4] - \33[32m[ON]\033[0m Mouse Injection\n\n" : "   [4] - \33[31m[OFF]\033[0m Mouse Injection\n\n");
 	if(!locksettings)
 	{
 		printf("   [5] - Mouse Sensitivity: %d%%", sensitivity * 5);
@@ -274,16 +280,20 @@ static void GUI_Update(void)
 		else
 			printf("Not Available For Game");
 		printf(selectedoption == EDITINGCROSSHAIR ? " [9 or - / 0 or +]\n\n" : "\n\n");
-		printf(invertpitch ? "   [7] - [ON] Invert Pitch\n\n" : "   [7] - [OFF] Invert Pitch\n\n");
+		printf(invertpitch ? "   [7] - \33[32m[ON]\033[0m Invert Pitch\n\n" : "   [7] - \33[31m[OFF]\033[0m Invert Pitch\n\n");
 		if (GAME_OptionSupported())
 			printf("   [8] - %s\n\n", GAME_OptionMessage());
 		printf("\n\n\n\n\n");
-		printf("   [CTRL+0] - Lock Settings\n\n");
+		printf("   [CTRL+1] - Lock Settings\n\n");
+		if (isPcsx2handle == 1 && PS2HasBase == 0)
+		{
+			printf(altPCSX2hook ? "   [CTRL+2] - \33[31m[ON]\033[0m Slow alternative PCSX2 hook\n\n" : "   [CTRL+2] - [OFF] Slow alternative PCSX2 hook\n\n");
+		}
 	}
 	else
 	{
 		printf("\n\n\n\n\n\n\n\n\n\n\n");
-		printf("   [CTRL+0] - Unlock Settings\n\n");
+		printf("   [CTRL+1] - Unlock Settings\n\n");
 	}
 	if(mousetoggle || locksettings)
 		printf(" Note: [9 or - / 0 or +] to Change Values\n%s\n", LINE);
@@ -364,13 +374,14 @@ static void INI_Load(void)
 			counter++; // add 1 to counter, so the next line can be read
 		}
 		fclose(fileptr); // close the file stream
-		if(counter == 5) // check if mouseinjector.ini length is valid
+		if(counter == 6) // check if mouseinjector.ini length is valid
 		{
 			sensitivity = ClampInt(atoi(line[0]), 1, 200);
 			crosshair = ClampInt(atoi(line[1]), 0, 18);
 			invertpitch = !(!atoi(line[2]));
 			locksettings = !(!atoi(line[3]));
-			welcomed = !(!atoi(line[4]));
+			altPCSX2hook = !(!atoi(line[4]));
+			welcomed = !(!atoi(line[5]));
 		}
 		else
 		{
@@ -392,7 +403,7 @@ static void INI_Save(const uint8_t showerror)
 	FILE *fileptr; // create a file pointer and open mouseinjector.ini from same dir as our program
 	if((fileptr = fopen("mouseinjector.ini", "w")) != NULL) // if the INI exists
 	{
-		fprintf(fileptr, "%u\n%u\n%u\n%u\n%u", sensitivity, crosshair, invertpitch, locksettings, welcomed); // write current settings to mouseinjector.ini
+		fprintf(fileptr, "%u\n%u\n%u\n%u\n%u\n%u", sensitivity, crosshair, invertpitch, locksettings, altPCSX2hook, welcomed); // write current settings to mouseinjector.ini
 		fclose(fileptr); // close the file stream
 	}
 	else if(showerror) // if saving file failed

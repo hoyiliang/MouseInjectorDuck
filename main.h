@@ -20,8 +20,8 @@
 #include <string.h>
 
 #define DOLPHINVERSION "emulators"
-#define BUILDINFO "(v0.41 - "__DATE__")"
-#define LINE "__________________________________________________________________"
+#define BUILDINFO "(v0.43 - "__DATE__")"
+#define LINE "____________________________________________________________________________"
 // input for interface
 #define K_1 GetAsyncKeyState(0x31) // key '1'
 #define K_2 GetAsyncKeyState(0x32) // key '2'
@@ -35,6 +35,7 @@
 #define K_0 GetAsyncKeyState(0x30) // key '0'
 #define K_CTRL0 (GetAsyncKeyState(0x11) && GetAsyncKeyState(0x30) || GetAsyncKeyState(0x30) && GetAsyncKeyState(0x11)) // key combo control + '0'
 #define K_CTRL1 (GetAsyncKeyState(0x11) && GetAsyncKeyState(0x31) || GetAsyncKeyState(0x31) && GetAsyncKeyState(0x11)) // key combo control + '1'
+#define K_CTRL2 (GetAsyncKeyState(0x11) && GetAsyncKeyState(0x32) || GetAsyncKeyState(0x32) && GetAsyncKeyState(0x11)) // key combo control + '1'
 #define K_PLUS (GetAsyncKeyState(0x6B) || GetAsyncKeyState(0xBB)) // key '+'
 #define K_MINUS (GetAsyncKeyState(0x6D) || GetAsyncKeyState(0xBD)) // key '-'
 #define K_INSERT GetAsyncKeyState(0x2D) // key 'Insert'
@@ -71,6 +72,7 @@ extern void AccumulateAddRemainder(float *value, float *accumulator, float dir, 
 extern uint8_t sensitivity;
 extern uint8_t crosshair;
 extern uint8_t invertpitch;
+extern uint8_t altPCSX2hook;
 extern uint8_t optionToggle;
 extern float out;
 extern float out2;

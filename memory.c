@@ -36,7 +36,6 @@ static int isN64handle = 0;
 static int isMupenhandle = 0;
 static int isBizHawkhandle = 0;
 static int isBSNEShandle = 0;
-static int isPcsx2handle = 0;
 static int isRetroArchHandle = 0;
 static int isKronosHandle = 0;
 static int isBeetlePSXHandle = 0;
@@ -52,6 +51,7 @@ static int isBizHawkPlayStationHandle = 0;
 static int isNOMONEYPSXHandle = 0;
 static int isProject64Handle = 0;
 static int isPS1PCSXRHandle = 0;
+int isPcsx2handle = 0;
 char hookedEmulatorName[80];
 
 uint8_t MEM_Init(void);
@@ -112,9 +112,11 @@ void PS2_MEM_WriteWord(const uint32_t addr, uint32_t value);
 void PS2_MEM_WriteUInt(const uint32_t addr, uint32_t value);
 void PS2_MEM_WriteUInt16(const uint32_t addr, uint16_t value);
 void PS2_MEM_WriteInt16(const uint32_t addr, int16_t value);
+void PS2_MEM_WriteUInt8(const uint32_t addr, uint8_t value);
 void PS2_MEM_WriteFloat(const uint32_t addr, float value);
 DWORD Process_ID = 0;
 char PS2_EXE_Name[64];
+uint64_t PS2HasBase = 0;
 
 uint32_t SD_MEM_ReadWord(const uint32_t addr);
 float SD_MEM_ReadFloat(const uint32_t addr);
@@ -312,7 +314,6 @@ uint8_t MEM_FindRamOffset(void)
 			ReadProcessMemory(emuhandle, (LPCVOID)pointerAddress, &foundValue, sizeof(foundValue), NULL);
 			emuoffset = foundValue;
 		}
-		printdebug(emuoffset);
 	}
 
 	if (isPS1PCSXRHandle == 1)
@@ -342,27 +343,32 @@ uint8_t MEM_FindRamOffset(void)
 		const char *processName = PS2_EXE_Name;
 		const char *moduleName = processName;
 		const char *symbol = "EEmem";
-		int chunk_size = 4096; // mem region size
 
 		HANDLE snapshot = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, Process_ID);
 		HMODULE hMod = MEM_REMOTE_HANDLE(Process_ID, moduleName);
 		FARPROC addr = MEM_REMOTE_ADDRESS(snapshot, hMod, symbol);
 		CloseHandle(snapshot);
-		//search from EEmem SLUS string offset to different copy of virtual PS2 RAM
+
 		uint64_t pointerAddress = (uint64_t)(uintptr_t)addr;
 		if (addr != 0) {
 			uint64_t pointerAddress = (uint64_t)(uintptr_t)addr;
 			uint64_t EEmem;
+
+			ReadProcessMemory(emuhandle, (LPCVOID)pointerAddress, &EEmem, sizeof(EEmem), NULL);
+			emuoffset = EEmem;
+			PS2HasBase = emuoffset;
+			
+			//Slow alt hook for some games that do not like EEmem pointer e.g. CoD: FH
+			if (altPCSX2hook == 1) {
 			uint64_t AddressCopy;
 			uint64_t OtherCopyBase;
 			BYTE* buffer;
 			SIZE_T bytesRead;
 			LPCVOID address = 0;
-
-			ReadProcessMemory(emuhandle, (LPCVOID)pointerAddress, &EEmem, sizeof(EEmem), NULL); //EEmem is now set > offset this by 0x100000 > load up a chunk of data > loop to find ram copy that does not cause issues with injector, substract the 0x100000 and set emuoffset
+			int chunk_size = 4096; // mem region size
 			
 			BYTE* chunk = (BYTE*)malloc(chunk_size);
-
+			
 			uint64_t offset = EEmem + 0x100000; //use an offset where the gamecode is
 			LPCVOID remotePtr = (LPCVOID)offset;
 			ReadProcessMemory(emuhandle, remotePtr, chunk, chunk_size, &bytesRead); // array gets loaded up correctly
@@ -389,8 +395,7 @@ uint8_t MEM_FindRamOffset(void)
 
 			OtherCopyBase = AddressCopy - 0x100000;
 			emuoffset = OtherCopyBase;
-
-			// TODO: check the hotfix, clean up the code etc, remove the ridiculous printfs and code in normal debug page, and maybe some simple ui
+			}
 		}
 	}
 	//------------------------------------------------------------------------
@@ -1086,6 +1091,7 @@ uint32_t PS2_MEM_ReadWord(const uint32_t addr)
 	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
 	// printdebug(1); // debug
 	MEM_ByteSwap32(&output); // byteswap
+	//printdebug(output); //What the fuck happens with these MEM_ReadWords? Sometimes they read absolute garbage
 	return output;
 }
 
@@ -1167,6 +1173,12 @@ void PS2_MEM_WriteInt16(const uint32_t addr, int16_t value)
 	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
 }
 
+void PS2_MEM_WriteUInt8(const uint32_t addr, uint8_t value)
+{
+	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+		return;
+	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+}
 
 void PS2_MEM_WriteFloat(const uint32_t addr, float value)
 {
