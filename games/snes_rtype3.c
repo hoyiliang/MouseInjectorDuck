@@ -18,6 +18,7 @@
 // along with this program; if not, visit http://www.gnu.org/licenses/gpl-2.0.html
 //==========================================================================
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
 #include "../main.h"

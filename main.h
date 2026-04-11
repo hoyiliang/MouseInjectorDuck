@@ -22,7 +22,17 @@
 #define DOLPHINVERSION "emulators"
 #define BUILDINFO "(v0.43 - "__DATE__")"
 #define LINE "____________________________________________________________________________"
+
+// cross-platform sleep macro (milliseconds)
+#ifdef _WIN32
+#define MI_SLEEP(ms) Sleep(ms)
+#else
+#include <unistd.h>
+#define MI_SLEEP(ms) usleep((ms) * 1000)
+#endif
+
 // input for interface
+#ifdef _WIN32
 #define K_1 GetAsyncKeyState(0x31) // key '1'
 #define K_2 GetAsyncKeyState(0x32) // key '2'
 #define K_3 GetAsyncKeyState(0x33) // key '3'
@@ -39,6 +49,29 @@
 #define K_PLUS (GetAsyncKeyState(0x6B) || GetAsyncKeyState(0xBB)) // key '+'
 #define K_MINUS (GetAsyncKeyState(0x6D) || GetAsyncKeyState(0xBD)) // key '-'
 #define K_INSERT GetAsyncKeyState(0x2D) // key 'Insert'
+#else
+// Linux: key input via non-blocking terminal read (set up in main.c)
+// These check a global lastkey var that gets updated each loop iteration
+extern int linux_lastkey;
+extern int linux_ctrl_held;
+extern void linux_poll_key(void);
+#define K_1 (linux_lastkey == '1')
+#define K_2 (linux_lastkey == '2')
+#define K_3 (linux_lastkey == '3')
+#define K_4 (linux_lastkey == '4')
+#define K_5 (linux_lastkey == '5')
+#define K_6 (linux_lastkey == '6')
+#define K_7 (linux_lastkey == '7')
+#define K_8 (linux_lastkey == '8')
+#define K_9 (linux_lastkey == '9')
+#define K_0 (linux_lastkey == '0')
+#define K_CTRL0 (linux_ctrl_held && linux_lastkey == '0')
+#define K_CTRL1 (linux_ctrl_held && linux_lastkey == '1')
+#define K_CTRL2 (linux_ctrl_held && linux_lastkey == '2')
+#define K_PLUS (linux_lastkey == '+' || linux_lastkey == '=')
+#define K_MINUS (linux_lastkey == '-' || linux_lastkey == '_')
+#define K_INSERT (linux_lastkey == 0x100)
+#endif
 #if _MSC_VER && !__INTEL_COMPILER // here because some MSVC versions only support __inline :/
 #define inline __inline
 #endif

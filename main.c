@@ -17,11 +17,118 @@
 // You should have received a copy of the GNU General Public License
 // along with this program; if not, visit http://www.gnu.org/licenses/gpl-2.0.html
 //==========================================================================
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
 #include "main.h"
+
+#ifndef _WIN32
+int linux_lastkey = 0;
+int linux_ctrl_held = 0;
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <linux/input.h>
+
+#define MAX_KBD 8
+static int kbd_fds[MAX_KBD];
+static int kbd_count = 0;
+
+static void linux_open_keyboards(void)
+{
+	DIR *dirp = opendir("/dev/input");
+	if (!dirp) return;
+	struct dirent *dent;
+	while ((dent = readdir(dirp)) != NULL && kbd_count < MAX_KBD)
+	{
+		char path[128];
+		snprintf(path, sizeof(path), "/dev/input/%s", dent->d_name);
+		int fd = open(path, O_RDONLY | O_NONBLOCK);
+		if (fd < 0) continue;
+
+		// Check if this device has keyboard keys (KEY_A = 30)
+		unsigned char keycaps[(KEY_MAX / 8) + 1];
+		memset(keycaps, 0, sizeof(keycaps));
+		if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keycaps)), keycaps) >= 0)
+		{
+			// Must have letter keys (KEY_A..KEY_Z) to be a real keyboard
+			if ((keycaps[KEY_A / 8] & (1 << (KEY_A % 8))) &&
+			    (keycaps[KEY_Z / 8] & (1 << (KEY_Z % 8))))
+			{
+				// Grab exclusively so keypresses don't leak to focused window
+				// (optional: comment out if you want keys to pass through)
+				// ioctl(fd, EVIOCGRAB, 1);
+				kbd_fds[kbd_count++] = fd;
+				char name[64] = {0};
+				ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+				fprintf(stderr, "[KBD] Opened %s: %s\n", path, name);
+				continue;
+			}
+		}
+		close(fd);
+	}
+	closedir(dirp);
+	fprintf(stderr, "[KBD] Found %d keyboard(s)\n", kbd_count);
+}
+
+static void linux_close_keyboards(void)
+{
+	for (int i = 0; i < kbd_count; i++)
+	{
+		if (kbd_fds[i] >= 0)
+			close(kbd_fds[i]);
+	}
+	kbd_count = 0;
+}
+
+void linux_poll_key(void)
+{
+	linux_lastkey = 0;
+
+	for (int i = 0; i < kbd_count; i++)
+	{
+		if (kbd_fds[i] < 0) continue;
+		struct input_event ev;
+		while (read(kbd_fds[i], &ev, sizeof(ev)) == sizeof(ev))
+		{
+			if (ev.type != EV_KEY) continue;
+			// Track CTRL held/released state
+			if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL)
+			{
+				linux_ctrl_held = (ev.value != 0); // 1=press, 2=repeat, 0=release
+				continue;
+			}
+			if (ev.value == 1) // key press (not repeat or release)
+			{
+				switch (ev.code)
+				{
+					case KEY_1: linux_lastkey = '1'; break;
+					case KEY_2: linux_lastkey = '2'; break;
+					case KEY_3: linux_lastkey = '3'; break;
+					case KEY_4: linux_lastkey = '4'; break;
+					case KEY_5: linux_lastkey = '5'; break;
+					case KEY_6: linux_lastkey = '6'; break;
+					case KEY_7: linux_lastkey = '7'; break;
+					case KEY_8: linux_lastkey = '8'; break;
+					case KEY_9: linux_lastkey = '9'; break;
+					case KEY_0: linux_lastkey = '0'; break;
+					case KEY_EQUAL: linux_lastkey = '+'; break;
+					case KEY_MINUS: linux_lastkey = '-'; break;
+					case KEY_ENTER:
+					case KEY_KPENTER: linux_lastkey = '\n'; break;
+					case KEY_INSERT: linux_lastkey = 0x100; break;
+				}
+			}
+		}
+	}
+}
+#endif
 #include "memory.h"
 #include "mouse.h"
 #include "./games/game.h"
@@ -69,7 +176,12 @@ static void INI_Save(const uint8_t showerror);
 //==========================================================================
 int32_t main(void)
 {
+#ifdef _WIN32
 	timeBeginPeriod(1);
+#else
+	linux_open_keyboards();
+	atexit(linux_close_keyboards);
+#endif
 
 	// TODO: Warn if multiple valid emulators are running
 	// Hide mouse when hooked to emulator and supported game is running
@@ -77,14 +189,14 @@ int32_t main(void)
 	if(!MEM_Init()) // close if dolphin or duckstation was not detected
 	{
 		printf("\n Mouse Injector for %s %s\n%s\n\n   Supported emulator not detected. Closing...", DOLPHINVERSION, BUILDINFO, LINE);
-		Sleep(3000);
+		MI_SLEEP(3000);
 		return 0;
 	}
 	if(!MOUSE_Init()) // close if mouse was not detected
 	{
 		printf("\n Mouse Injector for %s %s\n%s\n\n   Mouse not detected. Closing...", DOLPHINVERSION, BUILDINFO, LINE);
 		MEM_Quit();
-		Sleep(3000);
+		MI_SLEEP(3000);
 		return 0;
 	}
 	INI_Load(); // load settings
@@ -95,6 +207,9 @@ int32_t main(void)
 	int initialHookOccurred = 0;
 	while(1)
 	{
+#ifndef _WIN32
+		linux_poll_key();
+#endif
 		GUI_Interact(); // check hotkey input
 		int hooked = 0;
 		if(mousetoggle)
@@ -115,14 +230,14 @@ int32_t main(void)
 				hooked = 0;
 				initialHookOccurred = 0;
 				MEM_FindRamOffset();
-				Sleep(100);
+				MI_SLEEP(100);
 			}
 
-			Sleep(GAME_Tickrate());
+			MI_SLEEP(GAME_Tickrate());
 		}
-		else 
+		else
 		{
-			Sleep(100);
+			MI_SLEEP(100);
 		}
 
 		GUI_TitleShowHookStatus(hooked);
@@ -131,7 +246,9 @@ int32_t main(void)
 		// GUI_Update();
 	}
 
+#ifdef _WIN32
 	timeEndPeriod(1);
+#endif
 	return 0;
 }
 //==========================================================================
@@ -151,10 +268,18 @@ static void GUI_TitleShowHookStatus(int hooked)
 {
 	if (hooked == isHooked)
 		return;
+#ifdef _WIN32
 	if (hooked)
 		SetConsoleTitle("Mouse Injector | Hooked");
 	else
 		SetConsoleTitle("Mouse Injector | Unhooked");
+#else
+	if (hooked)
+		printf("\033]0;Mouse Injector | Hooked\007");
+	else
+		printf("\033]0;Mouse Injector | Unhooked\007");
+	fflush(stdout);
+#endif
 	isHooked = hooked;
 }
 //==========================================================================
@@ -162,8 +287,13 @@ static void GUI_TitleShowHookStatus(int hooked)
 //==========================================================================
 static void GUI_Init(void)
 {
+#ifdef _WIN32
 	SetConsoleTitle("Mouse Injector");
 	system("mode 80, 27"); // set window height and width
+#else
+	printf("\033]0;Mouse Injector\007");
+	fflush(stdout);
+#endif
 }
 //==========================================================================
 // Purpose: prints the welcome message
@@ -177,12 +307,19 @@ static void GUI_Welcome(void)
 	printf("    3)  NetPlay is unsupported - it will not synchronize memory injection\n\n");
 	printf("    4)  Press insert in the main menu to list supported games (NTSC only)\n\n");
 	printf("    5)  Read readme.txt for a quick start guide - thank you and enjoy\n\n\n");
+#ifdef _WIN32
 	printf("   Press CTRL+1 to confirm you've read this message...\n%s\n", LINE);
+#else
+	printf("   Press CTRL+1 to confirm you've read this message...\n%s\n", LINE);
+#endif
 	while(!welcomed)
 	{
-		if(K_CTRL1) // if user pressed CTRL+1
+		if(K_CTRL1) // if user pressed CTRL+1 (Windows) or Enter (Linux)
 			welcomed = 1;
-		Sleep(250);
+		MI_SLEEP(250);
+#ifndef _WIN32
+		linux_poll_key();
+#endif
 	}
 }
 //==========================================================================
@@ -238,7 +375,7 @@ static void GUI_Interact(void)
 	if(K_INSERT && !locksettings && !updateinterface && !mousetoggle) // show list of supported games (INSERT)
 	{
 		GUI_ListGames();
-		Sleep(10 * 1000); // wait 10 seconds
+		MI_SLEEP(10 * 1000); // wait 10 seconds
 		K_INSERT; // flush input
 		updateinterface = 1;
 		updatequick = 1;
@@ -256,7 +393,7 @@ static void GUI_Interact(void)
 	if(updateinterface)
 	{
 		GUI_Update();
-		Sleep(updatequick ? 100 : 200);
+		MI_SLEEP(updatequick ? 100 : 200);
 	}
 }
 //==========================================================================
@@ -284,21 +421,37 @@ static void GUI_Update(void)
 		if (GAME_OptionSupported())
 			printf("   [8] - %s\n\n", GAME_OptionMessage());
 		printf("\n\n\n\n\n");
+#ifdef _WIN32
 		printf("   [CTRL+1] - Lock Settings\n\n");
+#else
+		printf("   [CTRL+1] - Lock Settings\n\n");
+#endif
 		if (isPcsx2handle == 1 && PS2HasBase == 0)
 		{
+#ifdef _WIN32
 			printf(altPCSX2hook ? "   [CTRL+2] - \33[31m[ON]\033[0m Slow alternative PCSX2 hook\n\n" : "   [CTRL+2] - [OFF] Slow alternative PCSX2 hook\n\n");
+#else
+			printf(altPCSX2hook ? "   [CTRL+2] - \33[31m[ON]\033[0m Slow alternative PCSX2 hook\n\n" : "   [CTRL+2] - [OFF] Slow alternative PCSX2 hook\n\n");
+#endif
 		}
 	}
 	else
 	{
 		printf("\n\n\n\n\n\n\n\n\n\n\n");
+#ifdef _WIN32
 		printf("   [CTRL+1] - Unlock Settings\n\n");
+#else
+		printf("   [CTRL+1] - Unlock Settings\n\n");
+#endif
 	}
 	if(mousetoggle || locksettings)
 		printf(" Note: [9 or - / 0 or +] to Change Values\n%s\n", LINE);
 	else
+#ifdef _WIN32
 		printf(" Note: [9 or - / 0 or +] to Change Values - [Insert] for Supported Games\n%s\n", LINE);
+#else
+		printf(" Note: [9 or - / 0 or +] to Change Values - [Insert] for Supported Games\n%s\n", LINE);
+#endif
 	
 	// printf("tankBase: %X\n", uIntOut1);
 	// printf("turretbase: %X\n", uIntOut2);
@@ -344,6 +497,7 @@ static void GUI_ListGames(void)
 //==========================================================================
 static void GUI_Clear(void)
 {
+#ifdef _WIN32
 	DWORD n; // number of characters written
 	DWORD size; // number of visible characters
 	COORD coord = {0}; // top left screen position
@@ -355,6 +509,10 @@ static void GUI_Clear(void)
 	GetConsoleScreenBufferInfo(consolehandle, &csbi);
 	FillConsoleOutputAttribute(consolehandle, csbi.wAttributes, size, coord, &n);
 	SetConsoleCursorPosition(consolehandle, coord); // reset the cursor to the top left position
+#else
+	printf("\033[2J\033[H");
+	fflush(stdout);
+#endif
 }
 //==========================================================================
 // Purpose: loads settings stored in mouseinjector.ini
@@ -385,13 +543,21 @@ static void INI_Load(void)
 		}
 		else
 		{
-			MessageBox(HWND_DESKTOP, "Loading mouseinjector.ini failed!\n\nUnknown values detected, loading default settings.", "Error", MB_ICONERROR | MB_OK); // tell the user loading mouseinjector.ini failed
+#ifdef _WIN32
+			MessageBox(HWND_DESKTOP, "Loading mouseinjector.ini failed!\n\nUnknown values detected, loading default settings.", "Error", MB_ICONERROR | MB_OK);
+#else
+			fprintf(stderr, "Error: Loading mouseinjector.ini failed! Unknown values detected, loading default settings.\n");
+#endif
 			INI_Save(1); // overwrite mouseinjector.ini with valid settings
 		}
 	}
 	else // if loading file failed
 	{
-		MessageBox(HWND_DESKTOP, "Loading mouseinjector.ini failed!\n\nAttempting to create mouseinjector.ini file.", "Error", MB_ICONERROR | MB_OK); // tell the user loading mouseinjector.ini failed
+#ifdef _WIN32
+		MessageBox(HWND_DESKTOP, "Loading mouseinjector.ini failed!\n\nAttempting to create mouseinjector.ini file.", "Error", MB_ICONERROR | MB_OK);
+#else
+		fprintf(stderr, "Error: Loading mouseinjector.ini failed! Attempting to create mouseinjector.ini file.\n");
+#endif
 		INI_Save(1); // create mouseinjector.ini
 	}
 }
@@ -407,7 +573,13 @@ static void INI_Save(const uint8_t showerror)
 		fclose(fileptr); // close the file stream
 	}
 	else if(showerror) // if saving file failed
-		MessageBox(HWND_DESKTOP, "Saving mouseinjector.ini failed!", "Error", MB_ICONERROR | MB_OK); // tell the user saving mouseinjector.ini failed
+	{
+#ifdef _WIN32
+		MessageBox(HWND_DESKTOP, "Saving mouseinjector.ini failed!", "Error", MB_ICONERROR | MB_OK);
+#else
+		fprintf(stderr, "Error: Saving mouseinjector.ini failed!\n");
+#endif
+	}
 }
 
 // dx = change to value

@@ -39,6 +39,47 @@ work very well if you have also mapped the mouse buttons as you may click off th
 recommended and with dual-monitors it is recommended to put the cursor in the corner before hooking to
 avoid clicking off the window.
 
+## Building and Running on Linux
+
+### Requirements
+- GCC, make
+- libX11 development headers (e.g. `libx11-dev` on Debian/Ubuntu, `libx11` on Arch)
+
+### Build
+```bash
+make
+```
+
+### Running with sudo (quick start)
+```bash
+sudo -E ./mouseinjector 2>debug.log
+```
+
+### Running without sudo (recommended)
+One-time setup — creates a udev rule for `/dev/uinput` and adds your user to the `input` group:
+```bash
+make setup-perms
+```
+Log out and back in for the group change to take effect. Then after each build:
+```bash
+make && make setcap
+./mouseinjector 2>debug.log
+```
+
+#### What `setup-perms` does:
+- Creates `/etc/udev/rules.d/99-uinput.rules` so `/dev/uinput` is accessible to the `input` group (needed for cursor locking on Wayland)
+- Adds your user to the `input` group (needed for reading keyboard and mouse via evdev)
+
+#### What `setcap` does:
+- Grants `cap_sys_ptrace` to the binary (needed for reading emulator process memory via `/proc/<pid>/mem`)
+- Must be re-run after each rebuild
+
+### Notes
+- Tested on CachyOS (Arch-based) with KDE Plasma 6 on Wayland
+- Keyboard input is read globally via evdev — no terminal focus required
+- Cursor locking uses uinput on Wayland (XWarpPointer does not work under XWayland)
+- PCSX2: use the `pcsx2-qt` binary from the AUR. Hide cursor in PCSX2 settings and run fullscreen for best results
+
 # How to use with PCSX-REDUX
 For debugging and patch creating it is a better to use PCSX-REDUX. It has hands down the best PSX code debugger out there. 
 To use this injector with the emulator, you will need to run this lua script in PCSX-REDUX everytime you want to use the

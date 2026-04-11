@@ -19,18 +19,38 @@
 //==========================================================================
 #include <stdio.h> // for text file debug output
 #include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <inttypes.h> // hex conversion for memory debug
+
+#ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <tchar.h>
-#include <inttypes.h> // hex conversion for memory debug
+#else
+#include <unistd.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/uio.h>
+#include <errno.h>
+#include <signal.h>
+#endif
+
 #include "main.h"
 #include "memory.h"
+#ifdef _WIN32
 #include "export.h"
+#endif
 
 static uint64_t emuoffset = 0;
 static uint32_t aramoffset = 0x02000000; // REQUIRES that MMU is off
+#ifdef _WIN32
 static HANDLE emuhandle = NULL;
+#else
+static pid_t emupid = 0;
+static int emufd = -1; // fd for /proc/<pid>/mem
+#endif
 static int isPS1handle = 0;
 static int isN64handle = 0;
 static int isMupenhandle = 0;
@@ -114,7 +134,9 @@ void PS2_MEM_WriteUInt16(const uint32_t addr, uint16_t value);
 void PS2_MEM_WriteInt16(const uint32_t addr, int16_t value);
 void PS2_MEM_WriteUInt8(const uint32_t addr, uint8_t value);
 void PS2_MEM_WriteFloat(const uint32_t addr, float value);
+#ifdef _WIN32
 DWORD Process_ID = 0;
+#endif
 char PS2_EXE_Name[64];
 uint64_t PS2HasBase = 0;
 
@@ -135,15 +157,254 @@ float PSP_MEM_ReadFloat(const uint32_t addr);
 void PSP_MEM_WriteUInt16(const uint32_t addr, uint16_t value);
 void PSP_MEM_WriteFloat(const uint32_t addr, float value);
 
+#ifdef _WIN32
 FARPROC MEM_REMOTE_ADDRESS(HANDLE hProc, HMODULE hMod, const char* procName);
 HMODULE MEM_REMOTE_HANDLE(DWORD ProcessPID, const TCHAR* modName);
+#endif
 
 void printdebug(uint64_t val);
+
+//==========================================================================
+// Purpose: Cross-platform memory read/write helpers
+//==========================================================================
+static inline int emu_read(uint64_t addr, void *buf, size_t size)
+{
+#ifdef _WIN32
+	return emu_read(addr, buf, size) != 0;
+#else
+	if (emufd < 0) return 0;
+	ssize_t n = pread(emufd, buf, size, (off_t)addr);
+	return (n == (ssize_t)size);
+#endif
+}
+
+static inline int emu_write(uint64_t addr, const void *buf, size_t size)
+{
+#ifdef _WIN32
+	return emu_write(addr, buf, size) != 0;
+#else
+	if (emufd < 0) return 0;
+	ssize_t n = pwrite(emufd, buf, size, (off_t)addr);
+	return (n == (ssize_t)size);
+#endif
+}
+
+#ifndef _WIN32
+//==========================================================================
+// Purpose: find a process PID by name (Linux)
+// Returns: pid or 0 if not found
+//==========================================================================
+static pid_t find_process_by_name(const char *name)
+{
+	DIR *procdir = opendir("/proc");
+	if (!procdir) return 0;
+	struct dirent *entry;
+	while ((entry = readdir(procdir)) != NULL)
+	{
+		// skip non-numeric entries
+		char *endp;
+		long pid = strtol(entry->d_name, &endp, 10);
+		if (*endp != '\0' || pid <= 0) continue;
+
+		char comm_path[64];
+		snprintf(comm_path, sizeof(comm_path), "/proc/%ld/comm", pid);
+		FILE *f = fopen(comm_path, "r");
+		if (!f) continue;
+		char comm[256];
+		if (fgets(comm, sizeof(comm), f))
+		{
+			// strip trailing newline
+			size_t len = strlen(comm);
+			if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+			if (strcmp(comm, name) == 0)
+			{
+				fclose(f);
+				closedir(procdir);
+				return (pid_t)pid;
+			}
+		}
+		fclose(f);
+	}
+	closedir(procdir);
+	return 0;
+}
+
+//==========================================================================
+// Purpose: open /proc/<pid>/mem for read/write
+// Returns: fd or -1 on failure
+//==========================================================================
+static int open_proc_mem(pid_t pid)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/mem", (int)pid);
+	return open(path, O_RDWR);
+}
+
+//==========================================================================
+// Structures for parsing /proc/<pid>/maps on Linux
+//==========================================================================
+typedef struct {
+	uint64_t start;
+	uint64_t end;
+	char perms[5]; // rwxp
+	uint64_t offset;
+	char pathname[512];
+} MapRegion;
+
+// Parse a single line from /proc/<pid>/maps
+// Format: start-end perms offset dev inode pathname
+static int parse_maps_line(const char *line, MapRegion *region)
+{
+	memset(region, 0, sizeof(*region));
+	unsigned long long start, end, offset;
+	char perms[5] = {0};
+	int n = sscanf(line, "%llx-%llx %4s %llx %*s %*s %511[^\n]",
+		&start, &end, perms, &offset, region->pathname);
+	if (n < 4) return 0;
+	region->start = start;
+	region->end = end;
+	memcpy(region->perms, perms, 4);
+	region->offset = offset;
+	return 1;
+}
+
+//==========================================================================
+// Purpose: scan /proc/<pid>/maps for a region of the specified size
+//          with rw permissions. Returns base address or 0.
+//==========================================================================
+static uint64_t find_region_by_size(pid_t pid, uint64_t target_size)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/maps", (int)pid);
+	FILE *f = fopen(path, "r");
+	if (!f) return 0;
+	char line[1024];
+	while (fgets(line, sizeof(line), f))
+	{
+		MapRegion region;
+		if (!parse_maps_line(line, &region)) continue;
+		uint64_t size = region.end - region.start;
+		if (size == target_size && region.perms[0] == 'r' && region.perms[1] == 'w')
+		{
+			fclose(f);
+			return region.start;
+		}
+	}
+	fclose(f);
+	return 0;
+}
+
+//==========================================================================
+// Purpose: find ELF dynamic symbol address in a running process (Linux)
+//          Reads ELF headers from process memory to locate exported symbols
+// Returns: virtual address of symbol, or 0 if not found
+//==========================================================================
+#include <elf.h>
+static uint64_t find_elf_symbol(pid_t pid, int fd, const char *module_name, const char *symbol_name)
+{
+	// First find the module base address from /proc/pid/maps
+	char maps_path[64];
+	snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)pid);
+	FILE *f = fopen(maps_path, "r");
+	if (!f) return 0;
+
+	uint64_t module_base = 0;
+	char line[1024];
+	while (fgets(line, sizeof(line), f))
+	{
+		MapRegion region;
+		if (!parse_maps_line(line, &region)) continue;
+		if (region.offset == 0 && strstr(region.pathname, module_name) != NULL)
+		{
+			module_base = region.start;
+			break;
+		}
+	}
+	fclose(f);
+	if (module_base == 0) return 0;
+
+	// Read ELF header
+	Elf64_Ehdr ehdr;
+	if (pread(fd, &ehdr, sizeof(ehdr), (off_t)module_base) != sizeof(ehdr))
+		return 0;
+	if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0)
+		return 0;
+
+	// Read program headers to find PT_DYNAMIC
+	for (int i = 0; i < ehdr.e_phnum; i++)
+	{
+		Elf64_Phdr phdr;
+		if (pread(fd, &phdr, sizeof(phdr), (off_t)(module_base + ehdr.e_phoff + i * sizeof(phdr))) != sizeof(phdr))
+			continue;
+		if (phdr.p_type != PT_DYNAMIC)
+			continue;
+
+		// Parse dynamic section to find symbol table, string table, and hash
+		uint64_t dyn_addr = module_base + phdr.p_vaddr;
+		uint64_t symtab = 0, strtab = 0;
+		uint64_t strsz = 0;
+		uint32_t nchain = 0;
+		uint64_t hash_addr = 0;
+		uint64_t gnu_hash_addr = 0;
+
+		for (uint64_t off = 0; off < phdr.p_memsz; off += sizeof(Elf64_Dyn))
+		{
+			Elf64_Dyn dyn;
+			if (pread(fd, &dyn, sizeof(dyn), (off_t)(dyn_addr + off)) != sizeof(dyn))
+				break;
+			if (dyn.d_tag == DT_NULL) break;
+			switch (dyn.d_tag)
+			{
+				case DT_SYMTAB: symtab = dyn.d_un.d_ptr; break;
+				case DT_STRTAB: strtab = dyn.d_un.d_ptr; break;
+				case DT_STRSZ:  strsz = dyn.d_un.d_val; break;
+				case DT_HASH:   hash_addr = dyn.d_un.d_ptr; break;
+				case DT_GNU_HASH: gnu_hash_addr = dyn.d_un.d_ptr; break;
+			}
+		}
+
+		if (!symtab || !strtab) return 0;
+
+		// Determine number of symbols from DT_HASH (nchain field)
+		uint32_t nsyms = 0;
+		if (hash_addr)
+		{
+			uint32_t hash_header[2]; // nbucket, nchain
+			if (pread(fd, hash_header, sizeof(hash_header), (off_t)hash_addr) == sizeof(hash_header))
+				nsyms = hash_header[1]; // nchain = number of symbols
+		}
+
+		if (nsyms == 0)
+			nsyms = 4096; // fallback: iterate up to a reasonable limit
+
+		// Linear search through symbol table
+		for (uint32_t s = 0; s < nsyms; s++)
+		{
+			Elf64_Sym sym;
+			if (pread(fd, &sym, sizeof(sym), (off_t)(symtab + s * sizeof(sym))) != sizeof(sym))
+				break;
+			if (sym.st_name == 0 || sym.st_name >= strsz) continue;
+
+			char name[256];
+			ssize_t nr = pread(fd, name, sizeof(name) - 1, (off_t)(strtab + sym.st_name));
+			if (nr <= 0) continue;
+			name[nr < (ssize_t)(sizeof(name) - 1) ? nr : sizeof(name) - 1] = '\0';
+			if (strcmp(name, symbol_name) == 0)
+			{
+				return sym.st_value; // this is the virtual address
+			}
+		}
+		break; // only process first PT_DYNAMIC
+	}
+	return 0;
+}
+#endif
 
 //==========================================================================
 // Purpose: initialize dolphin handle and setup for memory injection
 // Changed Globals: emuhandle
 //==========================================================================
+#ifdef _WIN32
 uint8_t MEM_Init(void)
 {
 	emuhandle = NULL;
@@ -271,19 +532,96 @@ uint8_t MEM_Init(void)
 	CloseHandle(processes);
 	return (emuhandle != NULL);
 }
+#else // Linux
+uint8_t MEM_Init(void)
+{
+	emupid = 0;
+	emufd = -1;
+
+	// List of emulators to search for: {process_name, display_name, handler_setup}
+	struct { const char *comm; const char *display; int *flag; } emulators[] = {
+		{"pcsx2-qt",     "PCSX2",       &isPcsx2handle},
+		{"dolphin-emu",  "Dolphin",     NULL},
+		{"duckstation-q", "DuckStation", &isPS1handle}, // comm is truncated to 15 chars
+		{"retroarch",    "RetroArch",   NULL},
+		{"ppsspp",       "PPSSPP",      &isPPSSPPHandle},
+		{"rpcs3",        "RPCS3",       &isRPCS3Handle},
+		{NULL, NULL, NULL}
+	};
+
+	DIR *procdir = opendir("/proc");
+	if (!procdir) return 0;
+	struct dirent *entry;
+	while ((entry = readdir(procdir)) != NULL)
+	{
+		char *endp;
+		long pid = strtol(entry->d_name, &endp, 10);
+		if (*endp != '\0' || pid <= 0) continue;
+
+		char comm_path[64];
+		snprintf(comm_path, sizeof(comm_path), "/proc/%ld/comm", pid);
+		FILE *f = fopen(comm_path, "r");
+		if (!f) continue;
+		char comm[256];
+		int found = 0;
+		if (fgets(comm, sizeof(comm), f))
+		{
+			size_t len = strlen(comm);
+			if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+
+			for (int i = 0; emulators[i].comm != NULL; i++)
+			{
+				if (strncmp(comm, emulators[i].comm, strlen(emulators[i].comm)) == 0)
+				{
+					emupid = (pid_t)pid;
+					strcpy(hookedEmulatorName, emulators[i].display);
+					if (emulators[i].flag) *(emulators[i].flag) = 1;
+					found = 1;
+					break;
+				}
+			}
+		}
+		fclose(f);
+		if (found) break;
+	}
+	closedir(procdir);
+
+	if (emupid == 0) return 0;
+
+	emufd = open_proc_mem(emupid);
+	if (emufd < 0)
+	{
+		fprintf(stderr, "[DEBUG] MEM_Init: open_proc_mem(%d) failed: %s\n", (int)emupid, strerror(errno));
+		// Try with cmdline as fallback (some systems restrict /proc/pid/mem)
+		emupid = 0;
+		return 0;
+	}
+
+	fprintf(stderr, "[DEBUG] MEM_Init: emupid=%d emufd=%d isPcsx2=%d\n", (int)emupid, emufd, isPcsx2handle);
+	return 1;
+}
+#endif
 //==========================================================================
 // Purpose: close emuhandle safely
 // Changed Globals: emuhandle
 //==========================================================================
 void MEM_Quit(void)
 {
+#ifdef _WIN32
 	if(emuhandle != NULL)
 		CloseHandle(emuhandle);
+#else
+	if(emufd >= 0)
+		close(emufd);
+	emufd = -1;
+	emupid = 0;
+#endif
 }
 //==========================================================================
 // Purpose: update emuoffset pointer to location of gamecube memory
 // Changed Globals: emuoffset
 //==========================================================================
+#ifdef _WIN32
 uint8_t MEM_FindRamOffset(void)
 {
 	emuoffset = 0;
@@ -311,7 +649,7 @@ uint8_t MEM_FindRamOffset(void)
 		{
 			uint64_t pointerAddress = (uint64_t)(uintptr_t)addr;
 			uint64_t foundValue;
-			ReadProcessMemory(emuhandle, (LPCVOID)pointerAddress, &foundValue, sizeof(foundValue), NULL);
+			emu_read(pointerAddress, &foundValue, sizeof(foundValue));
 			emuoffset = foundValue;
 		}
 	}
@@ -354,7 +692,7 @@ uint8_t MEM_FindRamOffset(void)
 			uint64_t pointerAddress = (uint64_t)(uintptr_t)addr;
 			uint64_t EEmem;
 
-			ReadProcessMemory(emuhandle, (LPCVOID)pointerAddress, &EEmem, sizeof(EEmem), NULL);
+			emu_read(pointerAddress, &EEmem, sizeof(EEmem));
 			emuoffset = EEmem;
 			PS2HasBase = emuoffset;
 			
@@ -698,6 +1036,186 @@ uint8_t MEM_FindRamOffset(void)
 		lastRegionSize = info.RegionSize;
 	}
 }
+#else // Linux MEM_FindRamOffset
+uint8_t MEM_FindRamOffset(void)
+{
+	emuoffset = 0;
+	if (emufd < 0 || emupid == 0) return 0;
+
+	// ---- PCSX2: look for EE RAM via shared memory or 32MB region ----
+	if (isPcsx2handle == 1)
+	{
+		// First try to find EEmem symbol (works on non-stripped debug builds)
+		uint64_t sym_addr = find_elf_symbol(emupid, emufd, "pcsx2", "EEmem");
+		fprintf(stderr, "[DEBUG] PCSX2 EEmem symbol search: sym_addr=0x%llx\n", (unsigned long long)sym_addr);
+		if (sym_addr)
+		{
+			uint64_t EEmem;
+			if (emu_read(sym_addr, &EEmem, sizeof(EEmem)) && EEmem != 0)
+			{
+				emuoffset = EEmem;
+				PS2HasBase = emuoffset;
+				fprintf(stderr, "[DEBUG] Found EEmem via symbol: emuoffset=0x%llx\n", (unsigned long long)emuoffset);
+				return (emuoffset != 0x0);
+			}
+		}
+
+		// Try PCSX2 shared memory: /dev/shm/pcsx2_<pid>
+		// EE RAM is at offset 0 in this file. Open it via /proc/pid/fd/.
+		{
+			char shm_pattern[64];
+			snprintf(shm_pattern, sizeof(shm_pattern), "/dev/shm/pcsx2_%d", (int)emupid);
+
+			// Scan maps to find the shm file and its inode
+			char maps_path[64];
+			snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)emupid);
+			FILE *f = fopen(maps_path, "r");
+			if (!f) { fprintf(stderr, "[DEBUG] Cannot open %s\n", maps_path); return 0; }
+			char line[1024];
+			int found_shm = 0;
+			while (fgets(line, sizeof(line), f))
+			{
+				if (strstr(line, shm_pattern) != NULL)
+				{
+					found_shm = 1;
+					break;
+				}
+			}
+			fclose(f);
+
+			if (found_shm)
+			{
+				fprintf(stderr, "[DEBUG] Found PCSX2 shm mapping: %s\n", shm_pattern);
+
+				// Scan /proc/pid/fd/ for the fd that points to the shm file
+				char fd_dir[64];
+				snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", (int)emupid);
+				DIR *dirp = opendir(fd_dir);
+				if (dirp)
+				{
+					struct dirent *ent;
+					while ((ent = readdir(dirp)) != NULL)
+					{
+						char fd_path[128];
+						char link_target[512];
+						snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir, ent->d_name);
+						ssize_t llen = readlink(fd_path, link_target, sizeof(link_target) - 1);
+						if (llen <= 0) continue;
+						link_target[llen] = '\0';
+
+						if (strstr(link_target, shm_pattern) != NULL)
+						{
+							fprintf(stderr, "[DEBUG] Found shm fd: %s -> %s\n", fd_path, link_target);
+							int shm_fd = open(fd_path, O_RDWR);
+							if (shm_fd < 0)
+								shm_fd = open(fd_path, O_RDONLY);
+							if (shm_fd >= 0)
+							{
+								// Replace the emufd with the shm fd.
+								// EE RAM is at offset 0 in the shm file.
+								close(emufd);
+								emufd = shm_fd;
+								emuoffset = 0;
+								PS2HasBase = 1;
+								fprintf(stderr, "[DEBUG] Using shm fd %d, emuoffset=0 (EE RAM at start of shm)\n", shm_fd);
+								closedir(dirp);
+								return 1;
+							}
+							else
+							{
+								fprintf(stderr, "[DEBUG] Failed to open shm fd: %s: %s\n", fd_path, strerror(errno));
+							}
+						}
+					}
+					closedir(dirp);
+				}
+				fprintf(stderr, "[DEBUG] Could not find/open shm fd in %s\n", fd_dir);
+			}
+		}
+
+		// Last fallback: scan /proc/pid/maps for 32MB rw anonymous region
+		{
+			char maps_path[64];
+			snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)emupid);
+			FILE *f = fopen(maps_path, "r");
+			if (!f) return 0;
+			char line[1024];
+			while (fgets(line, sizeof(line), f))
+			{
+				MapRegion region;
+				if (!parse_maps_line(line, &region)) continue;
+				uint64_t size = region.end - region.start;
+				if (size == 0x2000000 && region.perms[0] == 'r' && region.perms[1] == 'w'
+					&& (region.pathname[0] == '\0' || region.pathname[0] == ' '))
+				{
+					emuoffset = region.start;
+					PS2HasBase = emuoffset;
+					fclose(f);
+					return (emuoffset != 0x0);
+				}
+			}
+			fclose(f);
+			return 0;
+		}
+	}
+
+	// ---- DuckStation: look for 2MB or 8MB rw- region (PS1 RAM) ----
+	if (isPS1handle == 1)
+	{
+		// Try ELF symbol first
+		uint64_t sym_addr = find_elf_symbol(emupid, emufd, "duckstation", "RAM");
+		if (sym_addr)
+		{
+			uint64_t RAM_ptr;
+			if (emu_read(sym_addr, &RAM_ptr, sizeof(RAM_ptr)) && RAM_ptr != 0)
+			{
+				emuoffset = RAM_ptr;
+				return (emuoffset != 0x0);
+			}
+		}
+
+		// Fallback: scan for 2MB (PS1 RAM) or 8MB region
+		char maps_path[64];
+		snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", (int)emupid);
+		FILE *f = fopen(maps_path, "r");
+		if (!f) return 0;
+		char line[1024];
+		while (fgets(line, sizeof(line), f))
+		{
+			MapRegion region;
+			if (!parse_maps_line(line, &region)) continue;
+			uint64_t size = region.end - region.start;
+			if ((size == 0x200000 || size == 0x800000)
+				&& region.perms[0] == 'r' && region.perms[1] == 'w'
+				&& (region.pathname[0] == '\0' || region.pathname[0] == ' '))
+			{
+				emuoffset = region.start;
+				fclose(f);
+				return (emuoffset != 0x0);
+			}
+		}
+		fclose(f);
+		return 0;
+	}
+
+	// ---- PPSSPP: look for ~31MB region (PSP RAM) ----
+	if (isPPSSPPHandle == 1)
+	{
+		uint64_t addr = find_region_by_size(emupid, 0x1F00000);
+		if (addr) { emuoffset = addr; return 1; }
+		return 0;
+	}
+
+	// ---- Generic fallback: Dolphin / other emulators ----
+	// Look for 0x2000000 (32MB, GameCube main RAM)
+	{
+		uint64_t addr = find_region_by_size(emupid, 0x2000000);
+		if (addr) { emuoffset = addr; return 1; }
+	}
+
+	return 0;
+}
+#endif
 //==========================================================================
 // Purpose: read int from memory
 // Parameter: address location
@@ -707,7 +1225,7 @@ int32_t MEM_ReadInt(const uint32_t addr)
 	if(!emuoffset || NOTWITHINMEMRANGE(addr)) // if gamecube memory has not been init by dolphin or reading from outside of memory range
 		return 0;
 	int32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + (addr - 0x80000000)), &output, sizeof(output));
 	MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
@@ -720,7 +1238,7 @@ uint32_t MEM_ReadUInt(const uint32_t addr)
 	if(!emuoffset || NOTWITHINMEMRANGE(addr)) // if gamecube memory has not been init by dolphin or reading from outside of memory range
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + (addr - 0x80000000)), &output, sizeof(output));
 	MEM_ByteSwap32(&output); // byteswap
 	return output;
 }
@@ -740,7 +1258,7 @@ uint16_t MEM_ReadUInt16(const uint32_t addr)
 	if(!emuoffset || NOTWITHINMEMRANGE(addr)) // if gamecube memory has not been init by dolphin or reading from outside of memory range
 		return 0;
 	uint16_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + (addr - 0x80000000)), &output, sizeof(output));
 	// MEM_ByteSwap32(&output); // byteswap
 	// TODO: needs byteswap to be proper
 	return output;
@@ -751,7 +1269,7 @@ uint8_t MEM_ReadUInt8(const uint32_t addr)
 	if(!emuoffset || NOTWITHINMEMRANGE(addr)) // if gamecube memory has not been init by dolphin or reading from outside of memory range
 		return 0;
 	uint8_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + (addr - 0x80000000)), &output, sizeof(output));
 	return output;
 }
 //==========================================================================
@@ -763,7 +1281,7 @@ float MEM_ReadFloat(const uint32_t addr)
 	if(!emuoffset || NOTWITHINMEMRANGE(addr)) // if gamecube memory has not been init by dolphin or reading from outside of memory range
 		return 0;
 	float output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + (addr - 0x80000000)), &output, sizeof(output));
 	MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
@@ -776,7 +1294,7 @@ void MEM_WriteInt(const uint32_t addr, int32_t value)
 	if(!emuoffset || NOTWITHINMEMRANGE(addr)) // if gamecube memory has not been init by dolphin or writing to outside of memory range
 		return;
 	MEM_ByteSwap32((uint32_t *)&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + (addr - 0x80000000)), &value, sizeof(value));
 }
 //==========================================================================
 // Purpose: write unsigned int to memory
@@ -787,7 +1305,7 @@ void MEM_WriteUInt(const uint32_t addr, uint32_t value)
 	if(!emuoffset || NOTWITHINMEMRANGE(addr)) // if gamecube memory has not been init by dolphin or writing to outside of memory range
 		return;
 	MEM_ByteSwap32(&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + (addr - 0x80000000)), &value, sizeof(value));
 }
 //==========================================================================
 // Purpose: write float to memory
@@ -798,7 +1316,7 @@ void MEM_WriteFloat(const uint32_t addr, float value)
 	if(!emuoffset || NOTWITHINMEMRANGE(addr)) // if gamecube memory has not been init by dolphin or writing to outside of memory range
 		return;
 	MEM_ByteSwap32((uint32_t *)&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + (addr - 0x80000000)), &value, sizeof(value));
 }
 //==========================================================================
 // Purpose: byteswap input value
@@ -826,7 +1344,7 @@ int32_t ARAM_ReadInt(const uint32_t addr)
 	if(!emuoffset || NOTWITHINARAMRANGE(addr)) // if gamecube memory has not been init by dolphin or reading from outside of memory range
 		return 0;
 	int32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + aramoffset + (addr - 0x7E000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + aramoffset + (addr - 0x7E000000)), &output, sizeof(output));
 	MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
@@ -839,7 +1357,7 @@ uint32_t ARAM_ReadUInt(const uint32_t addr)
 	if(!emuoffset || NOTWITHINARAMRANGE(addr)) // if gamecube memory has not been init by dolphin or reading from outside of memory range
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + aramoffset + (addr - 0x7E000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + aramoffset + (addr - 0x7E000000)), &output, sizeof(output));
 	MEM_ByteSwap32(&output); // byteswap
 	return output;
 }
@@ -852,7 +1370,7 @@ float ARAM_ReadFloat(const uint32_t addr)
 	if(!emuoffset || NOTWITHINARAMRANGE(addr)) // if gamecube memory has not been init by dolphin or reading from outside of memory range
 		return 0;
 	float output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + aramoffset + (addr - 0x7E000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + aramoffset + (addr - 0x7E000000)), &output, sizeof(output));
 	MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
@@ -865,7 +1383,7 @@ void ARAM_WriteUInt(const uint32_t addr, uint32_t value)
 	if(!emuoffset || NOTWITHINARAMRANGE(addr)) // if gamecube memory has not been init by dolphin or writing to outside of memory range
 		return;
 	MEM_ByteSwap32(&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + aramoffset + (addr - 0x7E000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + aramoffset + (addr - 0x7E000000)), &value, sizeof(value));
 }
 //==========================================================================
 // Purpose: write float to ARAM ***REQUIRES MMU TO BE DISABLED IN DOLPHIN***
@@ -877,7 +1395,7 @@ void ARAM_WriteFloat(const uint32_t addr, float value)
 		return;
 	MEM_ByteSwap32((uint32_t *)&value); // byteswap
 	// ARAM offset = 0x02000000
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + aramoffset + (addr - 0x7E000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + aramoffset + (addr - 0x7E000000)), &value, sizeof(value));
 }
 
 uint32_t PS1_MEM_ReadPointer(const uint32_t addr)
@@ -887,7 +1405,7 @@ uint32_t PS1_MEM_ReadPointer(const uint32_t addr)
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output;
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return (output - 0x80000000); // return address minus the 0x8 on the front
 }
 
@@ -896,7 +1414,7 @@ uint32_t PS1_MEM_ReadWord(const uint32_t addr)
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output;
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	MEM_ByteSwap32(&output); // byteswap
 	return output;
 }
@@ -906,7 +1424,7 @@ uint32_t PS1_MEM_ReadUInt(const uint32_t addr)
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output;
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -915,7 +1433,7 @@ int32_t PS1_MEM_ReadInt(const uint32_t addr)
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return 0;
 	int32_t output;
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -924,7 +1442,7 @@ int16_t PS1_MEM_ReadInt16(const uint32_t addr)
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return 0;
 	int16_t output;
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -934,7 +1452,7 @@ uint16_t PS1_MEM_ReadHalfword(const uint32_t addr)
 		return 0;
 	// read only 2 bytes
 	uint16_t output;
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -943,7 +1461,7 @@ uint8_t PS1_MEM_ReadByte(const uint32_t addr)
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint8_t output;
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -951,35 +1469,35 @@ void PS1_MEM_WriteInt(const uint32_t addr, int32_t value)
 {
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS1_MEM_WriteInt16(const uint32_t addr, int16_t value)
 {
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS1_MEM_WriteWord(const uint32_t addr, uint32_t value)
 {
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS1_MEM_WriteHalfword(const uint32_t addr, uint16_t value)
 {
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS1_MEM_WriteByte(const uint32_t addr, uint8_t value)
 {
 	if(!emuoffset || PS1NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 //==========================================================================
@@ -990,7 +1508,7 @@ uint32_t N64_MEM_ReadUInt(const uint32_t addr)
 	if(!emuoffset || N64NOTWITHINMEMRANGE(addr)) // if n64 memory has not been init by emulator or reading from outside of memory range
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + (addr - 0x80000000)), &output, sizeof(output));
 	return output;
 }
 
@@ -999,7 +1517,7 @@ int16_t N64_MEM_ReadInt16(const uint32_t addr)
 	if(!emuoffset || N64NOTWITHINMEMRANGE(addr)) // if n64 memory has not been init by emulator or reading from outside of memory range
 		return 0;
 	int16_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + (addr - 0x80000000)), &output, sizeof(output));
 	return output;
 }
 
@@ -1008,7 +1526,7 @@ float N64_MEM_ReadFloat(const uint32_t addr)
 	if(!emuoffset || N64NOTWITHINMEMRANGE(addr)) // if n64 memory has not been init by emulator or reading from outside of memory range
 		return 0;
 	float output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &output, sizeof(output), NULL);
+	emu_read((emuoffset + (addr - 0x80000000)), &output, sizeof(output));
 	return output;
 }
 
@@ -1016,28 +1534,28 @@ void N64_MEM_WriteUInt(const uint32_t addr, uint32_t value)
 {
 	if(!emuoffset || N64NOTWITHINMEMRANGE(addr)) // if n64 memory has not been init by emulator or writing to outside of memory range
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + (addr - 0x80000000)), &value, sizeof(value));
 }
 
 void N64_MEM_WriteInt16(const uint32_t addr, int16_t value)
 {
 	if(!emuoffset || N64NOTWITHINMEMRANGE(addr)) // if n64 memory has not been init by emulator or writing to outside of memory range
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + (addr - 0x80000000)), &value, sizeof(value));
 }
 
 void N64_MEM_WriteByte(const uint32_t addr, uint8_t value)
 {
 	if(!emuoffset || N64NOTWITHINMEMRANGE(addr)) // if n64 memory has not been init by emulator or writing to outside of memory range
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + (addr - 0x80000000)), &value, sizeof(value));
 }
 
 void N64_MEM_WriteFloat(const uint32_t addr, float value)
 {
 	if(!emuoffset || N64NOTWITHINMEMRANGE(addr)) // if n64 memory has not been init by emulator or writing to outside of memory range
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + (addr - 0x80000000)), &value, sizeof(value), NULL);
+	emu_write((emuoffset + (addr - 0x80000000)), &value, sizeof(value));
 }
 
 uint8_t SNES_MEM_ReadByte(const uint32_t addr)
@@ -1045,7 +1563,7 @@ uint8_t SNES_MEM_ReadByte(const uint32_t addr)
 	if(!emuoffset || SNESNOTWITHINMEMRANGE(addr)) // if snes memory has not been init by emulator or reading from outside of memory range
 		return 0;
 	uint8_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -1054,7 +1572,7 @@ uint16_t SNES_MEM_ReadWord(const uint32_t addr) // 16bit word
 	if(!emuoffset || SNESNOTWITHINMEMRANGE(addr)) // if snes memory has not been init by emulator or reading from outside of memory range
 		return 0;
 	uint16_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -1062,22 +1580,22 @@ void SNES_MEM_WriteByte(const uint32_t addr, uint8_t value)
 {
 	if(!emuoffset || SNESNOTWITHINMEMRANGE(addr)) // if snes memory has not been init by emulator or writing to outside of memory range
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void SNES_MEM_WriteWord(const uint32_t addr, uint16_t value) // 16bit word
 {
 	if(!emuoffset || SNESNOTWITHINMEMRANGE(addr)) // if snes memory has not been init by emulator or writing to outside of memory range
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 uint32_t PS2_MEM_ReadPointer(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// printdebug(1); // debug
 	// MEM_ByteSwap32(&output); // byteswap
 	return output;
@@ -1085,10 +1603,10 @@ uint32_t PS2_MEM_ReadPointer(const uint32_t addr)
 
 uint32_t PS2_MEM_ReadWord(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// printdebug(1); // debug
 	MEM_ByteSwap32(&output); // byteswap
 	//printdebug(output); //What the fuck happens with these MEM_ReadWords? Sometimes they read absolute garbage
@@ -1097,95 +1615,95 @@ uint32_t PS2_MEM_ReadWord(const uint32_t addr)
 
 uint32_t PS2_MEM_ReadUInt(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// printdebug(1); // debug
 	return output;
 }
 
 uint32_t PS2_MEM_ReadUInt16(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint16_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// printdebug(1); // debug
 	return output;
 }
 
 int16_t PS2_MEM_ReadInt16(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return 0;
 	int16_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
 uint8_t PS2_MEM_ReadUInt8(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint8_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// printdebug(1); // debug
 	return output;
 }
 
 float PS2_MEM_ReadFloat(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr)) 
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr)) 
 		return 0;
 	float output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
 
 void PS2_MEM_WriteWord(const uint32_t addr, uint32_t value)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return;
 	MEM_ByteSwap32(&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS2_MEM_WriteUInt(const uint32_t addr, uint32_t value)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS2_MEM_WriteUInt16(const uint32_t addr, uint16_t value)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS2_MEM_WriteInt16(const uint32_t addr, int16_t value)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS2_MEM_WriteUInt8(const uint32_t addr, uint8_t value)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PS2_MEM_WriteFloat(const uint32_t addr, float value)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr)) 
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr)) 
 		return;
 	// MEM_ByteSwap32((uint32_t *)&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 // TODO: give Dreamcast it's own within mem range
@@ -1194,10 +1712,10 @@ void PS2_MEM_WriteFloat(const uint32_t addr, float value)
 // =================================================
 uint32_t SD_MEM_ReadWord(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr)) 
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr)) 
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// printdebug(1); // debug
 	MEM_ByteSwap32(&output); // byteswap
 	return output;
@@ -1205,20 +1723,20 @@ uint32_t SD_MEM_ReadWord(const uint32_t addr)
 
 float SD_MEM_ReadFloat(const uint32_t addr)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr)) 
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr)) 
 		return 0;
 	float output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
 
 void SD_MEM_WriteFloat(const uint32_t addr, float value)
 {
-	if(!emuoffset || PS2NOTWITHINMEMRANGE(addr))
+	if(PS2_NO_OFFSET || PS2NOTWITHINMEMRANGE(addr))
 		return;
 	// MEM_ByteSwap32((uint32_t *)&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 // uint16_t SS_MEM_ReadHalfword(const uint32_t addr)
 // {
@@ -1235,7 +1753,7 @@ uint32_t PS3_MEM_ReadUInt(const uint32_t addr)
 	if(!emuoffset || PS3NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
@@ -1245,7 +1763,7 @@ uint32_t PS3_MEM_ReadPointer(const uint32_t addr)
 	if(!emuoffset || PS3NOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	if (output < 0x30000000)
 		return 0; // not a pointer
@@ -1257,7 +1775,7 @@ float PS3_MEM_ReadFloat(const uint32_t addr)
 	if(!emuoffset || PS3NOTWITHINMEMRANGE(addr))
 		return 0;
 	float output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
@@ -1267,7 +1785,7 @@ void PS3_MEM_WriteFloat(const uint32_t addr, float value)
 	if(!emuoffset || PS3NOTWITHINMEMRANGE(addr)) 
 		return;
 	MEM_ByteSwap32((uint32_t *)&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 uint32_t PSP_MEM_ReadWord(const uint32_t addr)
@@ -1275,7 +1793,7 @@ uint32_t PSP_MEM_ReadWord(const uint32_t addr)
 	if(!emuoffset || PSPNOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
@@ -1285,7 +1803,7 @@ uint32_t PSP_MEM_ReadPointer(const uint32_t addr)
 	if(!emuoffset || PSPNOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output - 0x8000000;
 }
 
@@ -1294,7 +1812,7 @@ uint32_t PSP_MEM_ReadUInt(const uint32_t addr)
 	if(!emuoffset || PSPNOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -1303,7 +1821,7 @@ uint16_t PSP_MEM_ReadUInt16(const uint32_t addr)
 	if(!emuoffset || PSPNOTWITHINMEMRANGE(addr))
 		return 0;
 	uint32_t output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	return output;
 }
 
@@ -1312,7 +1830,7 @@ float PSP_MEM_ReadFloat(const uint32_t addr)
 	if(!emuoffset || PSPNOTWITHINMEMRANGE(addr)) 
 		return 0;
 	float output; // temp var used for output of function
-	ReadProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &output, sizeof(output), NULL);
+	emu_read((emuoffset + addr), &output, sizeof(output));
 	// MEM_ByteSwap32((uint32_t *)&output); // byteswap
 	return output;
 }
@@ -1321,7 +1839,7 @@ void PSP_MEM_WriteUInt16(const uint32_t addr, uint16_t value)
 {
 	if(!emuoffset || PSPNOTWITHINMEMRANGE(addr))
 		return;
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void PSP_MEM_WriteFloat(const uint32_t addr, float value)
@@ -1329,7 +1847,7 @@ void PSP_MEM_WriteFloat(const uint32_t addr, float value)
 	if(!emuoffset || PSPNOTWITHINMEMRANGE(addr))
 		return;
 	// MEM_ByteSwap32((uint32_t *)&value); // byteswap
-	WriteProcessMemory(emuhandle, (LPVOID)(emuoffset + addr), &value, sizeof(value), NULL);
+	emu_write((emuoffset + addr), &value, sizeof(value));
 }
 
 void printdebug(uint64_t val) //hexadecimal addresses debug

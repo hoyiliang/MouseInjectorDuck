@@ -13,7 +13,11 @@
 static const char *manymouse_copyright =
     "ManyMouse " MANYMOUSE_VERSION " copyright (c) 2005-2012 Ryan C. Gordon.";
 
+#ifdef _WIN32
 extern const ManyMouseDriver *ManyMouseDriver_windows;
+#else
+extern const ManyMouseDriver *ManyMouseDriver_evdev;
+#endif
 
 /*
  * These have to be in the favored order...obviously it doesn't matter if the
@@ -27,7 +31,11 @@ extern const ManyMouseDriver *ManyMouseDriver_windows;
  */
 static const ManyMouseDriver **mice_drivers[] =
 {
+#ifdef _WIN32
     &ManyMouseDriver_windows,
+#else
+    &ManyMouseDriver_evdev,
+#endif
 };
 
 

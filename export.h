@@ -1,3 +1,4 @@
+#ifdef _WIN32
 //==========================================================================
 // Mouse Injector is free software; you can redistribute it and/or modify it
 // under the terms of the GNU General Public License as published by the Free
@@ -15,3 +16,4 @@
 
 extern HMODULE MEM_REMOTE_HANDLE(DWORD Process_ID, const TCHAR* modName);
 extern FARPROC MEM_REMOTE_ADDRESS(HANDLE snapshot, HMODULE hMod, const char* procName);
+#endif // _WIN32
