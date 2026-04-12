@@ -145,20 +145,8 @@ void MOUSE_Update(const uint16_t tickrate)
 		lockmousecounter++; // overflow pseudo-counter
 	}
 #else
-	if (uinput_fd >= 0 && uinput_active)
-	{
-		// Counteract physical mouse movement to keep cursor locked
-		// xmouse/ymouse still hold last tick's accumulated movement
-		if (xmouse != 0 || ymouse != 0)
-		{
-			struct input_event ev[3];
-			memset(ev, 0, sizeof(ev));
-			ev[0].type = EV_REL; ev[0].code = REL_X; ev[0].value = -xmouse;
-			ev[1].type = EV_REL; ev[1].code = REL_Y; ev[1].value = -ymouse;
-			ev[2].type = EV_SYN; ev[2].code = SYN_REPORT; ev[2].value = 0;
-			write(uinput_fd, ev, sizeof(ev));
-		}
-	}
+	// No-op on Linux; counter-movement happens per-event below
+	(void)tickrate;
 #endif
 	xmouse = ymouse = 0; // reset mouse input
 	while(ManyMouse_PollEvent(&event))
@@ -169,6 +157,19 @@ void MOUSE_Update(const uint16_t tickrate)
 				xmouse += event.value;
 			else
 				ymouse += event.value;
+#ifndef _WIN32
+			// Immediately counter each movement event to minimize cursor drift
+			if (uinput_fd >= 0 && uinput_active)
+			{
+				struct input_event ev[3];
+				memset(ev, 0, sizeof(ev));
+				ev[0].type = EV_REL;
+				ev[0].code = (event.item == 0) ? REL_X : REL_Y;
+				ev[0].value = -event.value;
+				ev[1].type = EV_SYN; ev[1].code = SYN_REPORT; ev[1].value = 0;
+				write(uinput_fd, ev, sizeof(struct input_event) * 2);
+			}
+#endif
 		}
 	}
 }
