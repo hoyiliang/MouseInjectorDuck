@@ -43,7 +43,6 @@ avoid clicking off the window.
 
 ### Requirements
 - GCC, make
-- libX11 development headers (e.g. `libx11-dev` on Debian/Ubuntu, `libx11` on Arch)
 
 ### Build
 ```bash
@@ -67,7 +66,7 @@ make && make setcap
 ```
 
 #### What `setup-perms` does:
-- Creates `/etc/udev/rules.d/99-uinput.rules` so `/dev/uinput` is accessible to the `input` group (needed for cursor locking on Wayland)
+- Creates `/etc/udev/rules.d/99-uinput.rules` so `/dev/uinput` is accessible to the `input` group (needed for forwarding mouse buttons while grabbed)
 - Adds your user to the `input` group (needed for reading keyboard and mouse via evdev)
 
 #### What `setcap` does:
@@ -77,7 +76,8 @@ make && make setcap
 ### Notes
 - Tested on CachyOS (Arch-based) with KDE Plasma 6 on Wayland
 - Keyboard input is read globally via evdev — no terminal focus required
-- Cursor locking uses uinput on Wayland (XWarpPointer does not work under XWayland)
+- Cursor locking uses EVIOCGRAB (exclusive evdev grab) — works on both X11 and Wayland
+- Mouse buttons and scroll are forwarded to the compositor via uinput while grabbed
 - PCSX2: use the `pcsx2-qt` binary from the AUR. Hide cursor in PCSX2 settings and run fullscreen for best results
 
 # How to use with PCSX-REDUX

@@ -27,7 +27,6 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/uinput.h>
-#include <X11/Xlib.h>
 #endif
 #include "mouse.h"
 #include "./manymouse/manymouse.h"
@@ -37,11 +36,8 @@ int32_t xmouse, ymouse; // holds mouse input data (used for gamedrivers)
 #ifdef _WIN32
 static POINT mouselock; // center screen X and Y var for mouse
 #else
-static int mouselock_x = 0, mouselock_y = 0;
-static Display *xdisplay = NULL;
-static Window xroot = 0;
-static int uinput_fd = -1;
-static int uinput_active = 0; // whether cursor warping is on
+static int mouse_grabbed = 0;
+static int uinput_fd = -1; // virtual mouse for forwarding buttons while grabbed
 #endif
 static ManyMouseEvent event; // hold current mouse event
 static uint8_t lockmousecounter = 0; // limit SetCursorPos execution
@@ -57,33 +53,30 @@ void MOUSE_Update(const uint16_t tickrate);
 uint8_t MOUSE_Init(void)
 {
 #ifndef _WIN32
-	// Open X11 display to query cursor position
-	xdisplay = XOpenDisplay(NULL);
-	if (xdisplay)
-		xroot = DefaultRootWindow(xdisplay);
-
-	// Create uinput device early so compositor detects it before we need it
+	// Create uinput virtual mouse for forwarding buttons/scroll while grabbed
 	uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
 	if (uinput_fd >= 0)
 	{
-		ioctl(uinput_fd, UI_SET_EVBIT, EV_REL);
-		ioctl(uinput_fd, UI_SET_RELBIT, REL_X);
-		ioctl(uinput_fd, UI_SET_RELBIT, REL_Y);
 		ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY);
 		ioctl(uinput_fd, UI_SET_KEYBIT, BTN_LEFT);
+		ioctl(uinput_fd, UI_SET_KEYBIT, BTN_RIGHT);
+		ioctl(uinput_fd, UI_SET_KEYBIT, BTN_MIDDLE);
+		ioctl(uinput_fd, UI_SET_KEYBIT, BTN_SIDE);
+		ioctl(uinput_fd, UI_SET_KEYBIT, BTN_EXTRA);
+		ioctl(uinput_fd, UI_SET_EVBIT, EV_REL);
+		ioctl(uinput_fd, UI_SET_RELBIT, REL_WHEEL);
+		ioctl(uinput_fd, UI_SET_RELBIT, REL_HWHEEL);
 
 		struct uinput_setup usetup = {0};
 		usetup.id.bustype = BUS_USB;
 		usetup.id.vendor = 0x1234;
 		usetup.id.product = 0x5678;
-		snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "MI Cursor Lock");
+		snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "MI Button Fwd");
 
 		ioctl(uinput_fd, UI_DEV_SETUP, &usetup);
 		ioctl(uinput_fd, UI_DEV_CREATE);
-		fprintf(stderr, "[MOUSE] uinput device created at init\n");
+		fprintf(stderr, "[MOUSE] uinput button forwarder created\n");
 	}
-	else
-		fprintf(stderr, "[MOUSE] Failed to open /dev/uinput: %m\n");
 #endif
 	return (ManyMouse_Init() > 0);
 }
@@ -92,20 +85,20 @@ uint8_t MOUSE_Init(void)
 //==========================================================================
 void MOUSE_Quit(void)
 {
-	ManyMouse_Quit();
 #ifndef _WIN32
+	if (mouse_grabbed)
+	{
+		ManyMouse_GrabMice(0);
+		mouse_grabbed = 0;
+	}
 	if (uinput_fd >= 0)
 	{
 		ioctl(uinput_fd, UI_DEV_DESTROY);
 		close(uinput_fd);
 		uinput_fd = -1;
 	}
-	if (xdisplay)
-	{
-		XCloseDisplay(xdisplay);
-		xdisplay = NULL;
-	}
 #endif
+	ManyMouse_Quit();
 }
 //==========================================================================
 // Purpose: update cursor lock position
@@ -115,18 +108,11 @@ void MOUSE_Lock(void)
 #ifdef _WIN32
 	GetCursorPos(&mouselock);
 #else
-	if (xdisplay)
-	{
-		Window child;
-		int win_x, win_y;
-		unsigned int mask;
-		XQueryPointer(xdisplay, xroot, &xroot, &child,
-			&mouselock_x, &mouselock_y, &win_x, &win_y, &mask);
-
-		uinput_active = !uinput_active;
-		fprintf(stderr, "[MOUSE] Lock %s at %d,%d\n",
-			uinput_active ? "ON" : "OFF", mouselock_x, mouselock_y);
-	}
+	// Toggle exclusive grab on the physical mice
+	// When grabbed, the compositor never sees mouse events = cursor stays put
+	mouse_grabbed = !mouse_grabbed;
+	ManyMouse_GrabMice(mouse_grabbed);
+	fprintf(stderr, "[MOUSE] Grab %s\n", mouse_grabbed ? "ON" : "OFF");
 #endif
 }
 //==========================================================================
@@ -145,7 +131,6 @@ void MOUSE_Update(const uint16_t tickrate)
 		lockmousecounter++; // overflow pseudo-counter
 	}
 #else
-	// No-op on Linux; counter-movement happens per-event below
 	(void)tickrate;
 #endif
 	xmouse = ymouse = 0; // reset mouse input
@@ -157,19 +142,38 @@ void MOUSE_Update(const uint16_t tickrate)
 				xmouse += event.value;
 			else
 				ymouse += event.value;
-#ifndef _WIN32
-			// Immediately counter each movement event to minimize cursor drift
-			if (uinput_fd >= 0 && uinput_active)
-			{
-				struct input_event ev[3];
-				memset(ev, 0, sizeof(ev));
-				ev[0].type = EV_REL;
-				ev[0].code = (event.item == 0) ? REL_X : REL_Y;
-				ev[0].value = -event.value;
-				ev[1].type = EV_SYN; ev[1].code = SYN_REPORT; ev[1].value = 0;
-				write(uinput_fd, ev, sizeof(struct input_event) * 2);
-			}
-#endif
 		}
+#ifndef _WIN32
+		// Forward buttons and scroll through uinput so PCSX2 still sees clicks
+		if (mouse_grabbed && uinput_fd >= 0)
+		{
+			struct input_event ev[2];
+			memset(ev, 0, sizeof(ev));
+			int send = 0;
+
+			if (event.type == MANYMOUSE_EVENT_BUTTON)
+			{
+				ev[0].type = EV_KEY;
+				ev[0].code = BTN_LEFT + event.item; // BTN_LEFT=0x110, +1=RIGHT, +2=MIDDLE...
+				ev[0].value = event.value;
+				send = 1;
+			}
+			else if (event.type == MANYMOUSE_EVENT_SCROLL)
+			{
+				ev[0].type = EV_REL;
+				ev[0].code = (event.item == 0) ? REL_WHEEL : REL_HWHEEL;
+				ev[0].value = event.value;
+				send = 1;
+			}
+
+			if (send)
+			{
+				ev[1].type = EV_SYN;
+				ev[1].code = SYN_REPORT;
+				ev[1].value = 0;
+				write(uinput_fd, ev, sizeof(ev));
+			}
+		}
+#endif
 	}
 }

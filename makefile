@@ -24,7 +24,7 @@ else
     CC = gcc
     EXENAME = $(SRCDIR)mouseinjector
     PLATFORM_OBJS = $(OBJDIR)linux_evdev.o $(OBJDIR)export.o
-    LIBS = -lX11 -lm
+    LIBS = -lm
     PLATFORM_LFLAGS = -s
 endif
 

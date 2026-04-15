@@ -206,7 +206,7 @@ static int init_mouse(const char *fname, int fd)
         snprintf(mouse->name, sizeof (mouse->name), "Unknown device");
 
     /* Skip our own uinput device to avoid feedback loop */
-    if (strncmp(mouse->name, "MI Cursor Lock", 14) == 0)
+    if (strncmp(mouse->name, "MI Button Fwd", 13) == 0)
         return 0;
 
     mouse->fd = fd;
@@ -331,8 +331,19 @@ static const ManyMouseDriver ManyMouseDriver_interface =
 
 const ManyMouseDriver *ManyMouseDriver_evdev = &ManyMouseDriver_interface;
 
+void ManyMouse_GrabMice(int grab)
+{
+    unsigned int i;
+    for (i = 0; i < available_mice; i++)
+    {
+        if (mice[i].fd != -1)
+            ioctl(mice[i].fd, EVIOCGRAB, grab ? 1 : 0);
+    }
+}
+
 #else
 const ManyMouseDriver *ManyMouseDriver_evdev = 0;
+void ManyMouse_GrabMice(int grab) { (void)grab; }
 #endif  /* ifdef Linux blocker */
 
 /* end of linux_evdev.c ... */

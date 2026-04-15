@@ -53,6 +53,10 @@ void ManyMouse_Quit(void);
 const char *ManyMouse_DeviceName(unsigned int index);
 int ManyMouse_PollEvent(ManyMouseEvent *event);
 
+#ifndef _WIN32
+void ManyMouse_GrabMice(int grab);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
