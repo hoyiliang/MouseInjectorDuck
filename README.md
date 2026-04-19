@@ -2,7 +2,7 @@
 
 An external app that injects cursor input into game memory. 
 
-### !This fork is focused only on Duckstation and PCSX2 emulators! Hooking of the other emulators could break without notice.
+### !This fork is focused only on PCSX2 emulators! Hooking of the other emulators could break without notice.
 ## Additional games for PS2 - NTSC ONLY:
 | Game Title | Issues |
 | --------- | ------------------ |
@@ -19,9 +19,9 @@ An external app that injects cursor input into game memory.
 ## This fork maintains only these emulators, thus they will work
 | Emulator/Frontend | Version | Executable name (case sensitive) |
 | --- | :---: | :---: |
-| DuckStation | stable, latest | duckstation-qt-x64-ReleaseLTCG.exe |
+| DuckStation | UNTESTED | duckstation-qt-x64-ReleaseLTCG.exe |
 | PCSX2 | stable, latest | pcsx2-qt.exe<br>pcsx2-qtx64.exe<br>pcsx2-qtx64-avx2.exe |
-| PCSX-REDUX | latest | pcsx-redux.exe |
+| PCSX-REDUX | UNTESTED | pcsx-redux.exe |
 * NOTE: PCSX2 will only hook with **BIOS versions 5XXXX and up**.
 
 ## How to Use
